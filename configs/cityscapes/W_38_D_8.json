@@ -122,7 +122,7 @@
     "loss": {
       "loss_type": "fs_auxohemce_loss",
       "params": {
-        "ce_reduction": "elementwise_mean",
+        "ce_reduction": "mean",
         "ce_ignore_index": -1,
         "ohem_minkeep": 200000,
         "ohem_thresh": 0.7

@@ -135,7 +135,7 @@
     "loss": {
       "loss_type": "ce2p_auxce_loss",
       "params": {
-        "ce_reduction": "elementwise_mean",
+        "ce_reduction": "mean",
         "ce_ignore_index": -1
       }
     }

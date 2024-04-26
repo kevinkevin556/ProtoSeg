@@ -132,7 +132,7 @@
     "loss": {
       "loss_type": "fs_auxce_loss",
       "params": {
-        "ce_reduction": "elementwise_mean",
+        "ce_reduction": "mean",
         "ce_ignore_index": -1
       }
     }
