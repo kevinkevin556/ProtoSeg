@@ -1,19 +1,16 @@
-import os
-import pdb
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
+from einops import rearrange, repeat
+from timm.layers import trunc_normal_
 
 from lib.models.backbones.backbone_selector import BackboneSelector
-from lib.models.tools.module_helper import ModuleHelper
-from lib.models.modules.projection import ProjectionHead
-from lib.utils.tools.logger import Logger as Log
+from lib.models.modules.contrast import ProjectionHead, l2_normalize, momentum_update
 from lib.models.modules.hanet_attention import HANet_Conv
-from lib.models.modules.contrast import momentum_update, l2_normalize, ProjectionHead
+from lib.models.modules.projection import ProjectionHead
 from lib.models.modules.sinkhorn import distributed_sinkhorn
-from timm.models.layers import trunc_normal_
-from einops import rearrange, repeat
+from lib.models.tools.module_helper import ModuleHelper
 
 
 class HRNet_W48(nn.Module):
@@ -24,16 +21,16 @@ class HRNet_W48(nn.Module):
     def __init__(self, configer):
         super(HRNet_W48, self).__init__()
         self.configer = configer
-        self.num_classes = self.configer.get('data', 'num_classes')
+        self.num_classes = self.configer.get("data", "num_classes")
         self.backbone = BackboneSelector(configer).get_backbone()
 
         # extra added layers
         in_channels = 720  # 48 + 96 + 192 + 384
         self.cls_head = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1),
-            ModuleHelper.BNReLU(in_channels, bn_type=self.configer.get('network', 'bn_type')),
+            ModuleHelper.BNReLU(in_channels, bn_type=self.configer.get("network", "bn_type")),
             nn.Dropout2d(0.10),
-            nn.Conv2d(in_channels, self.num_classes, kernel_size=1, stride=1, padding=0, bias=False)
+            nn.Conv2d(in_channels, self.num_classes, kernel_size=1, stride=1, padding=0, bias=False),
         )
 
     def forward(self, x_):
@@ -59,23 +56,24 @@ class HRNet_W48_Proto(nn.Module):
     def __init__(self, configer):
         super(HRNet_W48_Proto, self).__init__()
         self.configer = configer
-        self.gamma = self.configer.get('protoseg', 'gamma')
-        self.num_prototype = self.configer.get('protoseg', 'num_prototype')
-        self.use_prototype = self.configer.get('protoseg', 'use_prototype')
-        self.update_prototype = self.configer.get('protoseg', 'update_prototype')
-        self.pretrain_prototype = self.configer.get('protoseg', 'pretrain_prototype')
-        self.num_classes = self.configer.get('data', 'num_classes')
+        self.gamma = self.configer.get("protoseg", "gamma")
+        self.num_prototype = self.configer.get("protoseg", "num_prototype")
+        self.use_prototype = self.configer.get("protoseg", "use_prototype")
+        self.update_prototype = self.configer.get("protoseg", "update_prototype")
+        self.pretrain_prototype = self.configer.get("protoseg", "pretrain_prototype")
+        self.num_classes = self.configer.get("data", "num_classes")
         self.backbone = BackboneSelector(configer).get_backbone()
 
         in_channels = 720
         self.cls_head = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1),
-            ModuleHelper.BNReLU(in_channels, bn_type=self.configer.get('network', 'bn_type')),
-            nn.Dropout2d(0.10)
+            ModuleHelper.BNReLU(in_channels, bn_type=self.configer.get("network", "bn_type")),
+            nn.Dropout2d(0.10),
         )
 
-        self.prototypes = nn.Parameter(torch.zeros(self.num_classes, self.num_prototype, in_channels),
-                                       requires_grad=True)
+        self.prototypes = nn.Parameter(
+            torch.zeros(self.num_classes, self.num_prototype, in_channels), requires_grad=True
+        )
 
         self.proj_head = ProjectionHead(in_channels, in_channels)
         self.feat_norm = nn.LayerNorm(in_channels)
@@ -85,7 +83,7 @@ class HRNet_W48_Proto(nn.Module):
 
     def prototype_learning(self, _c, out_seg, gt_seg, masks):
         pred_seg = torch.max(out_seg, 1)[1]
-        mask = (gt_seg == pred_seg.view(-1))
+        mask = gt_seg == pred_seg.view(-1)
 
         cosine_similarity = torch.mm(_c, self.prototypes.view(-1, self.prototypes.shape[-1]).t())
 
@@ -106,11 +104,11 @@ class HRNet_W48_Proto(nn.Module):
 
             c_k = _c[gt_seg == k, ...]
 
-            m_k_tile = repeat(m_k, 'n -> n tile', tile=self.num_prototype)
+            m_k_tile = repeat(m_k, "n -> n tile", tile=self.num_prototype)
 
             m_q = q * m_k_tile  # n x self.num_prototype
 
-            c_k_tile = repeat(m_k, 'n -> n tile', tile=c_k.shape[-1])
+            c_k_tile = repeat(m_k, "n -> n tile", tile=c_k.shape[-1])
 
             c_q = c_k * c_k_tile  # n x embedding_dim
 
@@ -121,14 +119,14 @@ class HRNet_W48_Proto(nn.Module):
             if torch.sum(n) > 0 and self.update_prototype is True:
                 f = F.normalize(f, p=2, dim=-1)
 
-                new_value = momentum_update(old_value=protos[k, n != 0, :], new_value=f[n != 0, :],
-                                            momentum=self.gamma, debug=False)
+                new_value = momentum_update(
+                    old_value=protos[k, n != 0, :], new_value=f[n != 0, :], momentum=self.gamma, debug=False
+                )
                 protos[k, n != 0, :] = new_value
 
             proto_target[gt_seg == k] = indexs.float() + (self.num_prototype * k)
 
-        self.prototypes = nn.Parameter(l2_normalize(protos),
-                                       requires_grad=False)
+        self.prototypes = nn.Parameter(l2_normalize(protos), requires_grad=False)
 
         if dist.is_available() and dist.is_initialized():
             protos = self.prototypes.data.clone()
@@ -150,23 +148,23 @@ class HRNet_W48_Proto(nn.Module):
         c = self.cls_head(feats)
 
         c = self.proj_head(c)
-        _c = rearrange(c, 'b c h w -> (b h w) c')
+        _c = rearrange(c, "b c h w -> (b h w) c")
         _c = self.feat_norm(_c)
         _c = l2_normalize(_c)
 
         self.prototypes.data.copy_(l2_normalize(self.prototypes))
 
         # n: h*w, k: num_class, m: num_prototype
-        masks = torch.einsum('nd,kmd->nmk', _c, self.prototypes)
+        masks = torch.einsum("nd,kmd->nmk", _c, self.prototypes)
 
         out_seg = torch.amax(masks, dim=1)
         out_seg = self.mask_norm(out_seg)
         out_seg = rearrange(out_seg, "(b h w) k -> b k h w", b=feats.shape[0], h=feats.shape[2])
 
         if pretrain_prototype is False and self.use_prototype is True and gt_semantic_seg is not None:
-            gt_seg = F.interpolate(gt_semantic_seg.float(), size=feats.size()[2:], mode='nearest').view(-1)
+            gt_seg = F.interpolate(gt_semantic_seg.float(), size=feats.size()[2:], mode="nearest").view(-1)
             contrast_logits, contrast_target = self.prototype_learning(_c, out_seg, gt_seg, masks)
-            return {'seg': out_seg, 'logits': contrast_logits, 'target': contrast_target}
+            return {"seg": out_seg, "logits": contrast_logits, "target": contrast_target}
 
         return out_seg
 
@@ -179,17 +177,17 @@ class HRNet_W48_CONTRAST(nn.Module):
     def __init__(self, configer):
         super(HRNet_W48_CONTRAST, self).__init__()
         self.configer = configer
-        self.num_classes = self.configer.get('data', 'num_classes')
+        self.num_classes = self.configer.get("data", "num_classes")
         self.backbone = BackboneSelector(configer).get_backbone()
-        self.proj_dim = self.configer.get('contrast', 'proj_dim')
+        self.proj_dim = self.configer.get("contrast", "proj_dim")
 
         # extra added layers
         in_channels = 720  # 48 + 96 + 192 + 384
         self.cls_head = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1),
-            ModuleHelper.BNReLU(in_channels, bn_type=self.configer.get('network', 'bn_type')),
+            ModuleHelper.BNReLU(in_channels, bn_type=self.configer.get("network", "bn_type")),
             nn.Dropout2d(0.10),
-            nn.Conv2d(in_channels, self.num_classes, kernel_size=1, stride=1, padding=0, bias=False)
+            nn.Conv2d(in_channels, self.num_classes, kernel_size=1, stride=1, padding=0, bias=False),
         )
 
         self.proj_head = ProjectionHead(dim_in=in_channels, proj_dim=self.proj_dim)
@@ -207,36 +205,40 @@ class HRNet_W48_CONTRAST(nn.Module):
         out = self.cls_head(feats)
 
         emb = self.proj_head(feats)
-        return {'seg': out, 'embed': emb}
+        return {"seg": out, "embed": emb}
 
 
 class HRNet_W48_OCR_CONTRAST(nn.Module):
     def __init__(self, configer):
         super(HRNet_W48_OCR_CONTRAST, self).__init__()
         self.configer = configer
-        self.num_classes = self.configer.get('data', 'num_classes')
+        self.num_classes = self.configer.get("data", "num_classes")
         self.backbone = BackboneSelector(configer).get_backbone()
-        self.proj_dim = self.configer.get('contrast', 'proj_dim')
+        self.proj_dim = self.configer.get("contrast", "proj_dim")
 
         in_channels = 720
         self.conv3x3 = nn.Sequential(
             nn.Conv2d(in_channels, 512, kernel_size=3, stride=1, padding=1),
-            ModuleHelper.BNReLU(512, bn_type=self.configer.get('network', 'bn_type')),
+            ModuleHelper.BNReLU(512, bn_type=self.configer.get("network", "bn_type")),
         )
         from lib.models.modules.spatial_ocr_block import SpatialGather_Module
+
         self.ocr_gather_head = SpatialGather_Module(self.num_classes)
         from lib.models.modules.spatial_ocr_block import SpatialOCR_Module
-        self.ocr_distri_head = SpatialOCR_Module(in_channels=512,
-                                                 key_channels=256,
-                                                 out_channels=512,
-                                                 scale=1,
-                                                 dropout=0.05,
-                                                 bn_type=self.configer.get('network', 'bn_type'))
+
+        self.ocr_distri_head = SpatialOCR_Module(
+            in_channels=512,
+            key_channels=256,
+            out_channels=512,
+            scale=1,
+            dropout=0.05,
+            bn_type=self.configer.get("network", "bn_type"),
+        )
         self.cls_head = nn.Conv2d(512, self.num_classes, kernel_size=1, stride=1, padding=0, bias=True)
         self.aux_head = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1),
-            ModuleHelper.BNReLU(in_channels, bn_type=self.configer.get('network', 'bn_type')),
-            nn.Conv2d(in_channels, self.num_classes, kernel_size=1, stride=1, padding=0, bias=True)
+            ModuleHelper.BNReLU(in_channels, bn_type=self.configer.get("network", "bn_type")),
+            nn.Conv2d(in_channels, self.num_classes, kernel_size=1, stride=1, padding=0, bias=True),
         )
 
         self.proj_head = ProjectionHead(dim_in=in_channels, proj_dim=self.proj_dim)
@@ -262,7 +264,7 @@ class HRNet_W48_OCR_CONTRAST(nn.Module):
 
         out = self.cls_head(feats)
 
-        return {'seg': out, 'seg_aux': out_aux, 'embed': emb}
+        return {"seg": out, "seg_aux": out_aux, "embed": emb}
 
 
 class HRNet_W48_MEM(nn.Module):
@@ -270,10 +272,10 @@ class HRNet_W48_MEM(nn.Module):
         super(HRNet_W48_MEM, self).__init__()
         self.configer = configer
         self.m = m
-        self.r = self.configer.get('contrast', 'memory_size')
+        self.r = self.configer.get("contrast", "memory_size")
         self.with_masked_ppm = with_masked_ppm
 
-        num_classes = self.configer.get('data', 'num_classes')
+        num_classes = self.configer.get("data", "num_classes")
 
         self.encoder_q = HRNet_W48_CONTRAST(configer)
 
@@ -288,7 +290,7 @@ class HRNet_W48_MEM(nn.Module):
     @torch.no_grad()
     def _momentum_update_key_encoder(self):
         for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
-            param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
+            param_k.data = param_k.data * self.m + param_q.data * (1.0 - self.m)
 
     def forward(self, im_q, lb_q=None, with_embed=True, is_eval=False):
         if is_eval is True or lb_q is None:
@@ -297,38 +299,42 @@ class HRNet_W48_MEM(nn.Module):
 
         ret = self.encoder_q(im_q)
 
-        q = ret['embed']
-        out = ret['seg']
+        q = ret["embed"]
+        out = ret["seg"]
 
-        return {'seg': out, 'embed': q, 'key': q.detach(), 'lb_key': lb_q.detach()}
+        return {"seg": out, "embed": q, "key": q.detach(), "lb_key": lb_q.detach()}
 
 
 class HRNet_W48_OCR(nn.Module):
     def __init__(self, configer):
         super(HRNet_W48_OCR, self).__init__()
         self.configer = configer
-        self.num_classes = self.configer.get('data', 'num_classes')
+        self.num_classes = self.configer.get("data", "num_classes")
         self.backbone = BackboneSelector(configer).get_backbone()
 
         in_channels = 720
         self.conv3x3 = nn.Sequential(
             nn.Conv2d(in_channels, 512, kernel_size=3, stride=1, padding=1),
-            ModuleHelper.BNReLU(512, bn_type=self.configer.get('network', 'bn_type')),
+            ModuleHelper.BNReLU(512, bn_type=self.configer.get("network", "bn_type")),
         )
         from lib.models.modules.spatial_ocr_block import SpatialGather_Module
+
         self.ocr_gather_head = SpatialGather_Module(self.num_classes)
         from lib.models.modules.spatial_ocr_block import SpatialOCR_Module
-        self.ocr_distri_head = SpatialOCR_Module(in_channels=512,
-                                                 key_channels=256,
-                                                 out_channels=512,
-                                                 scale=1,
-                                                 dropout=0.05,
-                                                 bn_type=self.configer.get('network', 'bn_type'))
+
+        self.ocr_distri_head = SpatialOCR_Module(
+            in_channels=512,
+            key_channels=256,
+            out_channels=512,
+            scale=1,
+            dropout=0.05,
+            bn_type=self.configer.get("network", "bn_type"),
+        )
         self.cls_head = nn.Conv2d(512, self.num_classes, kernel_size=1, stride=1, padding=0, bias=True)
         self.aux_head = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1),
-            ModuleHelper.BNReLU(in_channels, bn_type=self.configer.get('network', 'bn_type')),
-            nn.Conv2d(in_channels, self.num_classes, kernel_size=1, stride=1, padding=0, bias=True)
+            ModuleHelper.BNReLU(in_channels, bn_type=self.configer.get("network", "bn_type")),
+            nn.Conv2d(in_channels, self.num_classes, kernel_size=1, stride=1, padding=0, bias=True),
         )
 
     def forward(self, x_):
@@ -364,29 +370,33 @@ class HRNet_W48_OCR_B(nn.Module):
     def __init__(self, configer):
         super(HRNet_W48_OCR_B, self).__init__()
         self.configer = configer
-        self.num_classes = self.configer.get('data', 'num_classes')
+        self.num_classes = self.configer.get("data", "num_classes")
         self.backbone = BackboneSelector(configer).get_backbone()
 
         in_channels = 720  # 48 + 96 + 192 + 384
         self.conv3x3 = nn.Sequential(
             nn.Conv2d(in_channels, 256, kernel_size=3, stride=1, padding=1),
-            ModuleHelper.BNReLU(256, bn_type=self.configer.get('network', 'bn_type')),
+            ModuleHelper.BNReLU(256, bn_type=self.configer.get("network", "bn_type")),
         )
         from lib.models.modules.spatial_ocr_block import SpatialGather_Module
+
         self.ocr_gather_head = SpatialGather_Module(self.num_classes)
         from lib.models.modules.spatial_ocr_block import SpatialOCR_Module
-        self.ocr_distri_head = SpatialOCR_Module(in_channels=256,
-                                                 key_channels=128,
-                                                 out_channels=256,
-                                                 scale=1,
-                                                 dropout=0.05,
-                                                 bn_type=self.configer.get('network', 'bn_type'))
+
+        self.ocr_distri_head = SpatialOCR_Module(
+            in_channels=256,
+            key_channels=128,
+            out_channels=256,
+            scale=1,
+            dropout=0.05,
+            bn_type=self.configer.get("network", "bn_type"),
+        )
 
         self.cls_head = nn.Conv2d(256, self.num_classes, kernel_size=1, stride=1, padding=0, bias=True)
         self.aux_head = nn.Sequential(
             nn.Conv2d(in_channels, 256, kernel_size=3, stride=1, padding=1),
-            ModuleHelper.BNReLU(256, bn_type=self.configer.get('network', 'bn_type')),
-            nn.Conv2d(256, self.num_classes, kernel_size=1, stride=1, padding=0, bias=True)
+            ModuleHelper.BNReLU(256, bn_type=self.configer.get("network", "bn_type")),
+            nn.Conv2d(256, self.num_classes, kernel_size=1, stride=1, padding=0, bias=True),
         )
 
     def forward(self, x_):
@@ -422,34 +432,38 @@ class HRNet_W48_OCR_B_HA(nn.Module):
     def __init__(self, configer):
         super(HRNet_W48_OCR_B_HA, self).__init__()
         self.configer = configer
-        self.num_classes = self.configer.get('data', 'num_classes')
+        self.num_classes = self.configer.get("data", "num_classes")
         self.backbone = BackboneSelector(configer).get_backbone()
 
         in_channels = 720  # 48 + 96 + 192 + 384
         self.conv3x3 = nn.Sequential(
             nn.Conv2d(in_channels, 256, kernel_size=3, stride=1, padding=1),
-            ModuleHelper.BNReLU(256, bn_type=self.configer.get('network', 'bn_type')),
+            ModuleHelper.BNReLU(256, bn_type=self.configer.get("network", "bn_type")),
         )
         from lib.models.modules.spatial_ocr_block import SpatialGather_Module
+
         self.ocr_gather_head = SpatialGather_Module(self.num_classes)
         from lib.models.modules.spatial_ocr_block import SpatialOCR_Module
-        self.ocr_distri_head = SpatialOCR_Module(in_channels=256,
-                                                 key_channels=128,
-                                                 out_channels=256,
-                                                 scale=1,
-                                                 dropout=0.05,
-                                                 bn_type=self.configer.get('network', 'bn_type'))
+
+        self.ocr_distri_head = SpatialOCR_Module(
+            in_channels=256,
+            key_channels=128,
+            out_channels=256,
+            scale=1,
+            dropout=0.05,
+            bn_type=self.configer.get("network", "bn_type"),
+        )
         self.cls_head = nn.Conv2d(256, self.num_classes, kernel_size=1, stride=1, padding=0, bias=True)
         self.aux_head = nn.Sequential(
             nn.Conv2d(in_channels, 256, kernel_size=3, stride=1, padding=1),
-            ModuleHelper.BNReLU(256, bn_type=self.configer.get('network', 'bn_type')),
-            nn.Conv2d(256, self.num_classes, kernel_size=1, stride=1, padding=0, bias=True)
+            ModuleHelper.BNReLU(256, bn_type=self.configer.get("network", "bn_type")),
+            nn.Conv2d(256, self.num_classes, kernel_size=1, stride=1, padding=0, bias=True),
         )
 
-        self.ha1 = HANet_Conv(384, 384, bn_type=self.configer.get('network', 'bn_type'))
-        self.ha2 = HANet_Conv(192, 192, bn_type=self.configer.get('network', 'bn_type'))
-        self.ha3 = HANet_Conv(96, 96, bn_type=self.configer.get('network', 'bn_type'))
-        self.ha4 = HANet_Conv(48, 48, bn_type=self.configer.get('network', 'bn_type'))
+        self.ha1 = HANet_Conv(384, 384, bn_type=self.configer.get("network", "bn_type"))
+        self.ha2 = HANet_Conv(192, 192, bn_type=self.configer.get("network", "bn_type"))
+        self.ha3 = HANet_Conv(96, 96, bn_type=self.configer.get("network", "bn_type"))
+        self.ha4 = HANet_Conv(48, 48, bn_type=self.configer.get("network", "bn_type"))
 
     def forward(self, x_):
         x = self.backbone(x_)

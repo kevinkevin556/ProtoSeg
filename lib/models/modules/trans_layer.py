@@ -1,16 +1,13 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from functools import partial
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
-import math
-from lib.utils.tools.logger import Logger as Log
-from lib.models.tools.module_helper import ModuleHelper
-from lib.models.modules.basic import SeparableConv2d
+from timm.layers import to_2tuple, trunc_normal_
 
 
-def make_sine_position_embedding(d_model, size, temperature=10000,
-                                 scale=2 * math.pi):
+
+def make_sine_position_embedding(d_model, size, temperature=10000, scale=2 * math.pi):
     h, w = size, size
     area = torch.ones(1, h, w)  # [b, h, w]
     y_embed = area.cumsum(1, dtype=torch.float32)
@@ -27,17 +24,15 @@ def make_sine_position_embedding(d_model, size, temperature=10000,
 
     pos_x = x_embed[:, :, :, None] / dim_t
     pos_y = y_embed[:, :, :, None] / dim_t
-    pos_x = torch.stack(
-        (pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4).flatten(3)
-    pos_y = torch.stack(
-        (pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4).flatten(3)
+    pos_x = torch.stack((pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4).flatten(3)
+    pos_y = torch.stack((pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4).flatten(3)
     pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2).contiguous()
     pos = pos.flatten(2).permute(0, 2, 1).contiguous()
     return pos
 
 
 class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.0):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
@@ -56,14 +51,14 @@ class Mlp(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0., sr_ratio=1):
+    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_scale=None, attn_drop=0.0, proj_drop=0.0, sr_ratio=1):
         super().__init__()
         assert dim % num_heads == 0, f"dim {dim} should be divided by num_heads {num_heads}."
 
         self.dim = dim
         self.num_heads = num_heads
         head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5
+        self.scale = qk_scale or head_dim**-0.5
 
         self.q = nn.Linear(dim, dim, bias=qkv_bias)
         self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
@@ -106,7 +101,7 @@ class SubPixelConv(nn.Module):
         self.in_chans = in_chans
         self.embed_dim = embed_dim
 
-        self.upsample = nn.Upsample(scale_factor=self.patch_size[0], align_corners=False, mode='bilinear')
+        self.upsample = nn.Upsample(scale_factor=self.patch_size[0], align_corners=False, mode="bilinear")
         self.upsample_proj = nn.Conv2d(in_chans, embed_dim, kernel_size=3, stride=1, padding=1, bias=True)
         # self.upsample_proj = SeparableConv2d(in_chans, embed_dim, 3)
         # self.upsample_proj = nn.Sequential(
@@ -119,8 +114,9 @@ class SubPixelConv(nn.Module):
 
     def _init_weights(self, m):
         import math
+
         if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
+            trunc_normal_(m.weight, std=0.02)
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
@@ -154,7 +150,7 @@ class ImmediaUpsample(nn.Module):
         super().__init__()
 
         self.conv = nn.Conv2d(in_channels=in_chans, out_channels=num_classes, kernel_size=1, stride=1)
-        self.upsample = nn.Upsample(scale_factor=factor, mode='bilinear')
+        self.upsample = nn.Upsample(scale_factor=factor, mode="bilinear")
 
     def forward(self, x):
         x = self.conv(x)
@@ -197,6 +193,7 @@ class AlignedModule(nn.Module):
 
         output = F.grid_sample(input, grid)
         return output
+
 
 # att low_feature + flow wrap high feature
 # class AlignedModule(nn.Module):
